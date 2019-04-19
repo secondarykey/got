@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -10,36 +13,37 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"golang.org/x/xerrors"
 )
 
-const Duration = 5
-
 var (
-	args        []string
-	defaultArgs []string
+	Cmd       string
+	SubCmd    string
+	CmdArgs   string
+	ArgsSlice []string
+	WatchPath string
+	Duration  int64
 )
 
 func init() {
-	defaultArgs = []string{"test", "-v", "./..."}
+	flag.StringVar(&Cmd, "c", "go", "Command Name")
+	flag.StringVar(&SubCmd, "s", "test", "Sub Command Name")
+	flag.StringVar(&CmdArgs, "a", "-v ./...", "Command Arguments")
+	flag.Int64Var(&Duration, "d", 5, "Lock Duration")
+	flag.StringVar(&WatchPath, "w", "./", "Watch path")
 }
 
 func main() {
 
-	if len(os.Args) > 1 {
-		args = make([]string, len(os.Args))
-		args[0] = "test"
-		for idx, elm := range os.Args[1:] {
-			args[idx+1] = elm
-		}
+	flag.Parse()
 
-	} else {
-		args = defaultArgs
-	}
-
-	err := circuit()
+	err := circuit(os.Stdout, os.Stdin)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Printf("error %+v", err)
+		os.Exit(1)
 	}
+
+	fmt.Println("bye!")
 	os.Exit(0)
 }
 
@@ -50,6 +54,8 @@ func lock() bool {
 	if now > lastUnixTime+Duration {
 		return true
 	}
+
+	log.Println("Please wait for a while and then execute.")
 	return false
 }
 
@@ -58,17 +64,24 @@ func unlock() {
 	lastUnixTime = now.Unix()
 }
 
-func circuit() error {
+func circuit(w io.Writer, r io.Reader) error {
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return err
+		return xerrors.Errorf("fsnotify.NewWatcher(): %w", err)
 	}
 	defer watcher.Close()
 
-	watcher.Add("./")
+	err = watcher.Add(WatchPath)
 	if err != nil {
-		return nil
+		return xerrors.Errorf("Watcher.Add(%s): %w", WatchPath, err)
+	}
+
+	args := strings.Split(CmdArgs, " ")
+	ArgsSlice = make([]string, 1+len(args))
+	ArgsSlice[0] = SubCmd
+	for idx, arg := range args {
+		ArgsSlice[idx+1] = arg
 	}
 
 	done := make(chan error)
@@ -80,18 +93,9 @@ func circuit() error {
 	go func() {
 		for {
 			select {
-			case event := <-watcher.Events:
+			case e := <-watcher.Events:
 
-				switch {
-				case event.Op&fsnotify.Rename == fsnotify.Rename:
-				case event.Op&fsnotify.Create == fsnotify.Create:
-				case event.Op&fsnotify.Remove == fsnotify.Remove:
-				case event.Op&fsnotify.Chmod == fsnotify.Chmod:
-				case event.Op&fsnotify.Write == fsnotify.Write:
-				default:
-				}
-
-				if !Ignore(event.Name) {
+				if !Ignore(e) {
 					ci <- true
 				}
 
@@ -136,7 +140,18 @@ func circuit() error {
 }
 
 //Ignore
-func Ignore(f string) bool {
+func Ignore(e fsnotify.Event) bool {
+
+	switch {
+	case e.Op&fsnotify.Rename == fsnotify.Rename:
+	case e.Op&fsnotify.Create == fsnotify.Create:
+	case e.Op&fsnotify.Remove == fsnotify.Remove:
+	case e.Op&fsnotify.Chmod == fsnotify.Chmod:
+	case e.Op&fsnotify.Write == fsnotify.Write:
+	default:
+	}
+
+	f := e.Name
 
 	//".go"
 	if len(f) < 3 {
@@ -160,18 +175,24 @@ func Ignore(f string) bool {
 func RunTest() error {
 
 	log.Println("\x1b[36m######################################################\x1b[0m")
-	run := []string{"\x1b[36m$ go"}
-	run = append(run, args...)
-	run = append(run, "\x1b[0m")
-	log.Println("Run", run)
 
-	cmd := exec.Command("go", args...)
+	cmd := exec.Command(Cmd, ArgsSlice...)
+	log.Println("Run", cmd.Args)
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Println(err)
-		return err
+		return xerrors.Errorf("command StdoutPipe(): %w", err)
 	}
-	cmd.Start()
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return xerrors.Errorf("command StderrPipe(): %w", err)
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		printStdError(stderr)
+		return xerrors.Errorf("command Start(): %w", err)
+	}
 
 	scanner := bufio.NewScanner(stdout)
 
@@ -192,10 +213,23 @@ func RunTest() error {
 
 	if err != nil {
 		log.Println("\x1b[31m" + err.Error() + "\x1b[0m")
+		printStdError(stderr)
 	}
 
-	log.Println("\x1b[36m# Press enter to execute.[quit] -> terminate.\x1b[0m")
+	log.Println("\x1b[36m# 'quit' -> terminate.\x1b[0m")
+	log.Println("\x1b[36m# Press enter to execute.\x1b[0m")
 	log.Println("\x1b[36m######################################################\x1b[0m")
 
 	return nil
+}
+
+func printStdError(r io.Reader) {
+	std, err := ioutil.ReadAll(r)
+	if err != nil {
+		if !xerrors.Is(err, os.ErrClosed) {
+			//log.Printf("%s\n", err)
+		}
+		return
+	}
+	log.Printf("%s\n", std)
 }
